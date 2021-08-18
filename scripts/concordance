@@ -17,7 +17,8 @@ can be done.
 from argparse import ArgumentParser
 from functools import reduce
 from itertools import chain, groupby, starmap
-from palaso.sfm import usfm, style
+import usfm
+from usfm import sfm, style
 from pathlib import Path
 from typing import (
     Callable,
@@ -29,7 +30,6 @@ from typing import (
     Union,
     cast)
 import csv
-import palaso.sfm as sfm
 import collections
 import warnings
 import shutil

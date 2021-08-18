@@ -3,8 +3,8 @@ import argparse
 import os
 import sys
 from pprint import pprint
-from palaso import sfm
-from palaso.sfm import usfm, style
+import usfm
+from usfm import sfm, style
 
 
 def appendsheet(fname, sheet):

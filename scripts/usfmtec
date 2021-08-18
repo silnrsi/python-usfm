@@ -11,7 +11,9 @@ __credits__ = '''\
 Tim Eves provided the concordance program on which this is based.
 '''
 
-from palaso.sfm import usfm, style, Element, Text, generate
+import usfm
+from usfm import style
+from usfm.sfm import Element, Text, generate
 from palaso.teckit.engine import Converter, Mapping
 from itertools import groupby, chain
 import csv

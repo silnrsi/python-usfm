@@ -8,8 +8,8 @@ __date__ = '29 October 2009'
 __author__ = 'Tim Eves <tim_eves@sil.org>'
 __credits__ = ''''''
 
-import palaso.sfm as sfm
-from palaso.sfm import usfm, style
+import usfm
+from usfm import style, sfm
 from itertools import chain
 from functools import reduce
 import codecs

@@ -5,7 +5,8 @@ errors found for each SFM file in the project.
 
 Automatically load the usfm.sty and custom.sty stylesheets if present
 '''
-from palaso.sfm import usfm, style
+import usfm
+from usfm import style
 from pathlib import Path
 from itertools import chain
 import argparse
