@@ -1,13 +1,10 @@
 '''
-The SFM parser module. It provides the basic stylesheet guided sfm parser
-and default TextType parser.  This parser provides detailed error and
-diagnostic messages including accurate line and column information as well
-as context information for structure errors.
-The default marker meta data makes this produce only top-level marker-text
-pairs.
+The USFM parser module, provides the default sytlesheet for USFM and
+USFM specific textype parsers to the palaso.sfm module.  These guide the
+palaso.sfm parser to so it can correctly parser USFM document structure.
 '''
-__version__ = '20200813'
-__date__ = '13 August 2020'
+__version__ = '20101011'
+__date__ = '11 October 2010'
 __author__ = 'Tim Eves <tim_eves@sil.org>'
 __history__ = '''
     20081210 - djd - Seperated SFM definitions from the module
@@ -18,964 +15,460 @@ __history__ = '''
         dict to module import time as part of import into palaso
         package.
     20101026 - tse - rewrote to enable the parser to use the stylesheets to
-        direct how to parse document structure and TextType to permit
-        specific semantics on subsections.
-    20101028 - tse - Handle endmarkers as a special case so the do no require
-        a space to separate them from the following text.
-    20101109 - tse - Fix separator space being included when it shouldn't and
-        use the unique field types set object to improve performance.
+        direct how to parse structure and USFM specific semantics.
+    20101109 - tse - Ensure cached usfm.sty is upto date after package code
+        changes.
 '''
-import collections
-import operator
-import re
-import warnings
-import os
-from itertools import chain, groupby
-from enum import IntEnum
+from itertools import chain
 from functools import reduce
-from typing import NamedTuple, Optional
+from . import sfm, style
+from .sfm import ErrorLevel
+import bz2
+import contextlib
+import operator
+import os
+import pickle
+import re
+import site
 
-__all__ = ('usfm',                                            # Sub modules
-           'Position', 'Element', 'Text', 'ErrorLevel', 'parser',  # data types
-           'sreduce', 'smap', 'sfilter', 'mpath',
-           'text_properties', 'format', 'copy')               # functions
-
-
-class Position(NamedTuple):
-    line: int
-    col: int
-
-    '''Immutable position data that attach to tokens'''
-    def __str__(self) -> str:
-        return f'line {self.line},{self.col}'
-
-    def advance(self, n):
-        return Position(self.line, self.col+n)
+_PALASO_DATA = os.path.join(
+    site.getuserbase(),
+    'palaso-python', 'sfm')
+_package_dir = os.path.dirname(__file__)
 
 
-class Element(list):
-    """
-    An sequence type representing a marker and it's child nodes which may
-    consist of more elements or text nodes. It contains metadata describing how
-    it was parsed and an annotations mapping to allow the parser or further
-    processing steps to attach notes or data to it.
-
-    >>> Element('marker')
-    Element('marker')
-
-    >>> str(Element('marker'))
-    '\\\\marker'
-
-    >>> str(Element('marker', args=['1','2']))
-    '\\\\marker 1 2'
-
-    >>> e = Element('marker', args=['1'],
-    ...             content=[Text('some text '),
-    ...                      Element('marker2',
-    ...                              content=[Text('more text\\n')]),
-    ...                      Element('blah',content=[Text('\\n')]),
-    ...                      Element('blah',content=[Text('\\n')]),
-    ...                      Element('yak', args=['yak'])])
-    >>> len(e)
-    5
-    >>> e.name
-    'marker'
-    >>> e.pos
-    Position(line=1, col=1)
-    >>> e.meta
-    {}
-    >>> print(str(e))
-    \\marker 1 some text \\marker2 more text
-    \\blah
-    \\blah
-    \\yak yak
-    >>> Element('marker') == Element('marker')
-    True
-    >>> Element('marker') == Element('different')
-    False
-    """
-    # __slots__ = ('pos', 'name', 'args', 'parent', 'meta', 'annotations')
-
-    def __init__(self, name,
-                 pos=Position(1, 1),
-                 args=[],
-                 parent=None,
-                 meta={},
-                 content=[]):
-        """
-        The `name` of the marker, and optionally any marker argments in
-        `args`. If this element is a child of another it `parent` should point
-        back to that element. The position in the source text can be supplied
-        with `pos`, and the marker stylesheet record used to parse it should be
-        passed with meta.
-        """
-        super().__init__(content)
-        self.name = str(name) if name else None
-        self.pos = pos
-        self.args = args
-        self.parent = parent
-        self.meta = meta
-        self.annotations = {}
-
-    def __repr__(self):
-        args = [repr(self.name)] \
-            + (self.args and [f'args={self.args!r}']) \
-            + (self and [f'content={super().__repr__()}'])
-        return f"Element({', '.join(args)!s})"
-
-    def __eq__(self, rhs):
-        if not isinstance(rhs, Element):
-            return False
-        return (self.name == rhs.name
-                and self.args == rhs.args
-                and (not (self.meta and rhs.meta) or self.meta == rhs.meta)
-                and super().__eq__(rhs))
-
-    def __str__(self):
-        marker = ''
-        nested = '+' if 'nested' in self.annotations else ''
-        if self.name:
-            marker = f"\\{nested}{' '.join([self.name] + self.args)}"
-        endmarker = self.meta.get('Endmarker', '')
-        body = ''.join(map(str, self))
-        sep = ''
-        if len(self) > 0:
-            if not body.startswith(('\r\n', '\n')):
-                sep = ' '
-        elif self.meta.get('StyleType') == 'Character':
-            body = ' '
-
-        if endmarker and 'implicit-closed' not in self.annotations:
-            body += f"\\{nested}{endmarker}"
-        return sep.join([marker, body])
+def _check_paths(pred, paths):
+    return next(filter(pred, map(os.path.normpath, paths)), None)
 
 
-class Text(str):
-    '''
-    An extended string type that tracks position and
-    parent/child relationship.
-
-    >>> from pprint import pprint
-    >>> Text('a test')
-    Text('a test')
-
-    >>> Text('prefix ',Position(3,10)).pos, Text('suffix',Position(1,6)).pos
-    (Position(line=3, col=10), Position(line=1, col=6))
-
-    >>> t = Text('prefix ',Position(3,10)) + Text('suffix',Position(1,6))
-    >>> t, t.pos
-    (Text('prefix suffix'), Position(line=3, col=10))
-
-    >>> t = Text('a few short words')[12:]
-    >>> t, t.pos
-    (Text('words'), Position(line=1, col=13))
-
-    >>> t = Text('   yuk spaces   ').lstrip()
-    >>> t, t.pos
-    (Text('yuk spaces   '), Position(line=1, col=4))
-
-    >>> t = Text('   yuk spaces   ').rstrip()
-    >>> t, t.pos
-    (Text('   yuk spaces'), Position(line=1, col=1))
-
-    >>> Text('   yuk spaces   ').strip()
-    Text('yuk spaces')
-
-    >>> pprint([(t,t.pos) for t in Text('a few short words').split(' ')])
-    [(Text('a'), Position(line=1, col=1)),
-     (Text('few'), Position(line=1, col=3)),
-     (Text('short'), Position(line=1, col=7)),
-     (Text('words'), Position(line=1, col=13))]
-
-    >>> list(map(str, Text('a few short words').split(' ')))
-    ['a', 'few', 'short', 'words']
-
-    >>> t=Text.concat([Text('a ', pos=Position(line=1, col=1)),
-    ...                Text('few ', pos=Position(line=1, col=3)),
-    ...                Text('short ', pos=Position(line=1, col=7)),
-    ...                Text('words', pos=Position(line=1, col=13))])
-    >>> t, t.pos
-    (Text('a few short words'), Position(line=1, col=1))
-    '''
-    def __new__(cls, content, pos=Position(1, 1), parent=None):
-        return super().__new__(cls, content)
-
-    def __init__(self, content, pos=Position(1, 1), parent=None):
-        self.pos = pos
-        self.parent = parent
-
-    @staticmethod
-    def concat(iterable):
-        i = iter(iterable)
-        h = next(i)
-        return Text(''.join(chain([h], i)), h.pos, h.parent)
-
-    def split(self, sep=None, maxsplit=-1):
-        sep = sep or ' '
-        tail = self
-        result = []
-        while tail and maxsplit != 0:
-            e = tail.find(sep)
-            if e == -1:
-                result.append(tail)
-                tail = Text('',
-                            tail.pos.advance(len(tail)),
-                            self.parent)
-                break
-            result.append(tail[:e])
-            tail = tail[e+len(sep):]
-            tail.pos = tail.pos.advance(e+len(sep))
-            maxsplit -= 1
-        if tail:
-            result.append(tail)
-        return result
-
-    def lstrip(self, *args, **kwds):
-        n = len(self)
-        s_ = super().lstrip(*args, **kwds)
-        return Text(s_,
-                    self.pos.advance(n-len(s_)),
-                    self.parent)
-
-    def rstrip(self, *args, **kwds):
-        s_ = super().rstrip(*args, **kwds)
-        return Text(s_, self.pos, self.parent)
-
-    def strip(self, *args, **kwds):
-        return self.lstrip(*args, **kwds).rstrip(*args, **kwds)
-
-    def __repr__(self):
-        return f'Text({super().__repr__()!s})'
-
-    def __add__(self, rhs):
-        return Text(super().__add__(rhs), self.pos, self.parent)
-
-    def __getslice__(self, i, j): return self.__getitem__(slice(i, j))
-
-    def __getitem__(self, i):
-        return Text(super().__getitem__(i),
-                    self.pos.advance(i.start or 0 if isinstance(i, slice) else i),
-                    self.parent)
+def _source_path(path):
+    return _check_paths(os.path.exists,
+                        [os.path.join(_PALASO_DATA, path),
+                         os.path.join(_package_dir, path)])
 
 
-class _put_back_iter(collections.Iterator):
-    '''
-    >>> i=_put_back_iter([1,2,3])
-    >>> next(i)
-    1
-    >>> next(i)
-    2
-    >>> i.put_back(256)
-    >>> next(i)
-    256
-    >>> i.peek()
-    3
-    >>> i.put_back(512)
-    >>> i.peek()
-    512
-    >>> next(i); next(i)
-    512
-    3
-    >>> next(i)
-    Traceback (most recent call last):
-    ...
-    StopIteration
-    '''
-    def __init__(self, iterable):
-        self._itr = iter(iterable)
-        self._pbq = []
+def _newer(cache, benchmark):
+    return os.path.getmtime(benchmark) <= os.path.getmtime(cache)
 
-    def __next__(self):
-        return self.next()
 
-    def next(self):
-        if self._pbq:
+def _is_fresh(cached_path, benchmarks):
+    return reduce(operator.and_, (_newer(cached_path, b) for b in benchmarks))
+
+
+def _cached_stylesheet(path):
+    cached_path = os.path.normpath(os.path.join(
+                        _PALASO_DATA,
+                        path+os.extsep+'cz'))
+    source_path = _source_path(path)
+    if os.path.exists(cached_path):
+        import glob
+        if _is_fresh(cached_path, [source_path]
+                     + glob.glob(os.path.join(_package_dir, '*.py'))):
+            return cached_path
+    else:
+        path = os.path.dirname(cached_path)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+    import pickletools
+    with contextlib.closing(bz2.BZ2File(cached_path, 'wb')) as zf:
+        zf.write(pickletools.optimize(
+            pickle.dumps(style.parse(open(source_path, 'r')))))
+    return cached_path
+
+
+def _load_cached_stylesheet(path):
+    try:
+        if not site.getuserbase():
+            raise FileNotFoundError
+        cached_path = _cached_stylesheet(path)
+        try:
             try:
-                return self._pbq.pop()
-            except Exception:
-                raise StopIteration
-        return next(self._itr)
+                with contextlib.closing(bz2.BZ2File(cached_path, 'rb')) as sf:
+                    return pickle.load(sf)
+            except (OSError, EOFError, pickle.UnpicklingError):
+                os.unlink(cached_path)
+                cached_path = _cached_stylesheet(path)
+                with contextlib.closing(bz2.BZ2File(cached_path, 'rb')) as sf:
+                    return pickle.load(sf)
+        except (OSError, pickle.UnpicklingError):
+            os.unlink(cached_path)
+            raise
+    except OSError:
+        return style.parse(open(_source_path(path), 'r'))
 
-    def put_back(self, value):
-        self._pbq.append(value)
 
-    def peek(self):
-        if not self._pbq:
-            self._pbq.append(next(self._itr))
-        return self._pbq[-1]
+default_stylesheet = _load_cached_stylesheet('usfm.sty')
 
-
-_default_meta = dict(
-    TextType='default',
+_default_meta = style.Marker(
+    TextType=style.CaselessStr('Milestone'),
     OccursUnder={None},
     Endmarker=None,
-    StyleType=None)
+    StyleType=None
+)
 
 
-class ErrorLevel(IntEnum):
-    """
-    Error levels used to control what the parser reports as warnings or errors
-    """
-    Note = -1
-    'Issues that do not affect the parse, but should be corrected.'
-    Marker = 0
-    "Markers that are not in the stylesheet or private namespace."
-    Content = 1
-    'Issues with parsing or formating marker arguments or element content.'
-    Structure = 2
-    'Issues that result in incorectly parsed document structure, if ignored.'
-    Unrecoverable = 100
-    'Always reported as an error, parser cannot make progress past it.'
-
-
-class Tag(NamedTuple):
-    name: str
-    nested: bool = False
-
-    def __str__(self) -> str:
-        return f"\\{'+' if self.nested else ''}{self.name}"
-
-    @property
-    def endmarker(self) -> bool:
-        return self.name[-1] == '*'
-
-
-class parser(collections.Iterable):
+class parser(sfm.parser):
     '''
-    SFM parser, and base class for more complex parsers such as USFM and the
-    stylesheet parser.  This can be used to parse unstructured SFM files as a
-    sequence of childless elements or text nodes. By supplying a stylesheet
-    structure can be extracted from a source, such as a USFM document.
-
-    Various options allow customisation of the strictness of error checking,
-    private tag space prefix or even what constitutes a marker, beyond just
-    starting with a '\\'.
-
-    >>> from pprint import pprint
     >>> import warnings
 
-    Test edge case text handling
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     list(parser([])); list(parser([''])); list(parser('plain text'))
-    []
-    []
-    [Text('plain text')]
+    Tests for inline markers
+    >>> list(parser([r'\\test'], parser.extend_stylesheet('test')))
+    [Element('test')]
+    >>> list(parser([r'\\test text'], parser.extend_stylesheet('test')))
+    [Element('test'), Text(' text')]
+    >>> list(parser([r'\\id JHN\\ior text\\ior*']))
+    [Element('id', content=[Text('JHN'), Element('ior', content=[Text('text')])])]
+    >>> list(parser([r'\\id MAT\\mt Text \\f + \\fk deep\\fk*\\f*more text.']))
+    [Element('id', content=[Text('MAT'), Element('mt', content=[Text('Text '), Element('f', args=['+'], content=[Element('fk', content=[Text('deep')])]), Text('more text.')])])]
+    >>> list(parser([r'\\id MAT\\mt Text \\f + \\fk deep \\+qt A quote \\+qt*more\\fk*\\f*more text.']))
+    [Element('id', content=[Text('MAT'), Element('mt', content=[Text('Text '), Element('f', args=['+'], content=[Element('fk', content=[Text('deep '), Element('qt', content=[Text('A quote ')]), Text('more')])]), Text('more text.')])])]
 
-    Test mixed marker and text and cross line coalescing
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     pprint(list(parser(r"""\\lonely
-    ... \\sfm text
-    ... bare text
-    ... \\more-sfm more text
-    ... over a line break\\marker""".splitlines(True))))
-    [Element('lonely', content=[Text('\\n')]),
-     Element('sfm', content=[Text('text\\nbare text\\n')]),
-     Element('more-sfm', content=[Text('more text\\nover a line break')]),
-     Element('marker')]
-
-    Default Backslash handling (just '\\')
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     pprint(list(parser([
-    ...         r"\\marker text",
-    ...         r"\\escaped backslash\\\\character",
-    ...         r"\\t1 \\t2 \\\\backslash \\^hat \\%\\t3\\\\\\^"])))
-    [Element('marker', content=[Text('text')]),
-     Element('escaped', content=[Text('backslash\\\\\\\\character')]),
-     Element('t1'),
-     Element('t2', content=[Text('\\\\\\\\backslash ')]),
-     Element('^hat'),
-     Element('%'),
-     Element('t3', content=[Text('\\\\\\\\')]),
-     Element('^')]
-
-    Specify extra escapable characters or tokens, in this case everything that
-    doesn't start with a number or letter isn't a tag.
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     pprint(list(parser([
-    ...         r"\\t1 \\t2 \\\\backslash \\^hat \\%\\t3\\\\\\^"],
-    ...         tag_escapes=r"[^0-9a-zA-Z]")))
-    [Element('t1'),
-     Element('t2', content=[Text('\\\\\\\\backslash \\\\^hat \\\\%')]),
-     Element('t3', content=[Text('\\\\\\\\\\\\^')])]
-
-
-    >>> doc=r"""
-    ... \\id MAT EN
-    ... \\ide UTF-8
-    ... \\rem from MATTHEW
-    ... \\h Mathew
-    ... \\toc1 Mathew
-    ... \\mt1 Mathew
-    ... \\mt2 Gospel Of Matthew"""
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     pprint(list(parser(doc.splitlines(True))))
-    [Text('\\n'),
-     Element('id', content=[Text('MAT EN\\n')]),
-     Element('ide', content=[Text('UTF-8\\n')]),
-     Element('rem', content=[Text('from MATTHEW\\n')]),
-     Element('h', content=[Text('Mathew\\n')]),
-     Element('toc1', content=[Text('Mathew\\n')]),
-     Element('mt1', content=[Text('Mathew\\n')]),
-     Element('mt2', content=[Text('Gospel Of Matthew')])]
-
-    >>> tss = parser.extend_stylesheet({},'id','ide','rem','h','toc1',
-    ...                                'mt1','mt2')
-    >>> pprint(tss)
-    {'h': {'Endmarker': None,
-           'OccursUnder': {None},
-           'StyleType': None,
-           'TextType': 'default'},
-     'id': {'Endmarker': None,
-            'OccursUnder': {None},
-            'StyleType': None,
-            'TextType': 'default'},
-     'ide': {'Endmarker': None,
-             'OccursUnder': {None},
-             'StyleType': None,
-             'TextType': 'default'},
-     'mt1': {'Endmarker': None,
-             'OccursUnder': {None},
-             'StyleType': None,
-             'TextType': 'default'},
-     'mt2': {'Endmarker': None,
-             'OccursUnder': {None},
-             'StyleType': None,
-             'TextType': 'default'},
-     'rem': {'Endmarker': None,
-             'OccursUnder': {None},
-             'StyleType': None,
-             'TextType': 'default'},
-     'toc1': {'Endmarker': None,
-              'OccursUnder': {None},
-              'StyleType': None,
-              'TextType': 'default'}}
-
+    Test end marker recognition when it's a prefix
     >>> with warnings.catch_warnings():
     ...     warnings.simplefilter("error")
-    ...     pprint(list(parser(doc.splitlines(True), tss)))
-    [Text('\\n'),
-     Element('id', content=[Text('MAT EN\\n')]),
-     Element('ide', content=[Text('UTF-8\\n')]),
-     Element('rem', content=[Text('from MATTHEW\\n')]),
-     Element('h', content=[Text('Mathew\\n')]),
-     Element('toc1', content=[Text('Mathew\\n')]),
-     Element('mt1', content=[Text('Mathew\\n')]),
-     Element('mt2', content=[Text('Gospel Of Matthew')])]
-    >>> tss['rem'].update(OccursUnder={'ide'})
+    ...     list(parser([r'\\id TEST\\mt \\f + text\\f*suffixed text']))
+    ...     list(parser([r'\\id TEST\\mt '
+    ...                  r'\\f + \\fr ref \\ft text\\f*suffixed text']))
+    [Element('id', content=[Text('TEST'), Element('mt', content=[Element('f', args=['+'], content=[Text('text')]), Text('suffixed text')])])]
+    [Element('id', content=[Text('TEST'), Element('mt', content=[Element('f', args=['+'], content=[Element('fr', content=[Text('ref ')]), Text('text')]), Text('suffixed text')])])]
+
+    Test footnote canonicalisation flag
     >>> with warnings.catch_warnings():
     ...     warnings.simplefilter("error")
-    ...     pprint(list(parser(doc.splitlines(True), tss)))
-    ... # doctest: +NORMALIZE_WHITESPACE
-    [Text('\\n'),
-     Element('id', content=[Text('MAT EN\\n')]),
-     Element('ide',
-             content=[Text('UTF-8\\n'),
-                      Element('rem', content=[Text('from MATTHEW\\n')])]),
-     Element('h', content=[Text('Mathew\\n')]),
-     Element('toc1', content=[Text('Mathew\\n')]),
-     Element('mt1', content=[Text('Mathew\\n')]),
-     Element('mt2', content=[Text('Gospel Of Matthew')])]
-    >>> del tss['mt1']
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("error")
-    ...     pprint(list(parser(doc.splitlines(True), tss)))
+    ...     list(parser([r'\\id TEST\\mt \\f + text\\f*suffixed text'],
+    ...                 canonicalise_footnotes=False))
+    ...     list(parser([r'\\id TEST\\mt '
+    ...                  r'\\f + \\fr ref \\ft text\\f*suffixed text'],
+    ...                 canonicalise_footnotes=False))
+    [Element('id', content=[Text('TEST'), Element('mt', content=[Element('f', args=['+'], content=[Text('text')]), Text('suffixed text')])])]
+    [Element('id', content=[Text('TEST'), Element('mt', content=[Element('f', args=['+'], content=[Element('fr', content=[Text('ref ')]), Element('ft', content=[Text('text')])]), Text('suffixed text')])])]
+
+    Test marker parameters, particularly chapter and verse markers
+    >>> list(parser([r'\\id TEST'         r'\\c 1']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['1'])])]
+    >>> list(parser([r'\\id TEST'         r'\\c 2 \\s text']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['2'], content=[Element('s', content=[Text('text')])])])]
+    >>> list(parser([r'\\id TEST\\c 0\\p' r'\\v 1']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['0'], content=[Element('p', content=[Element('v', args=['1'])])])])]
+    >>> list(parser([r'\\id TEST\\c 0\\p' r'\\v 1-3']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['0'], content=[Element('p', content=[Element('v', args=['1-3'])])])])]
+    >>> list(parser([r'\\id TEST\\c 0\\p' r'\\v 2 text']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['0'], content=[Element('p', content=[Element('v', args=['2']), Text('text')])])])]
+    >>> list(parser([r'\\id TEST'         r'\\c 2 \\p \\v 3 text\\v 4 verse']))
+    [Element('id', content=[Text('TEST'), Element('c', args=['2'], content=[Element('p', content=[Element('v', args=['3']), Text('text'), Element('v', args=['4']), Text('verse')])])])]
+
+    Test for error detection and reporting for structure
+    >>> list(parser([r'\\id TEST\\mt text\\f*']))
     Traceback (most recent call last):
     ...
-    SyntaxWarning: <string>: line 7,2: unknown marker \\mt1: not in stylesheet
-    '''
+    SyntaxError: <string>: line 1,17: orphan end marker \\f*: no matching opening marker \\f
+    >>> list(parser([r'\\id TEST     \\p 1 text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,14: orphan marker \\p: may only occur under \\c
+    >>> list(parser([r'\\id TEST\\mt \\f + text\\fe*']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,22: orphan end marker \\fe*: no matching opening marker \\fe
+    >>> list(parser([r'\\id TEST\\mt \\f + text'], ))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,1: invalid end marker end-of-file: \\f (line 1,13) can only be closed with \\f*
+
+    Test for error detection and reporting for USFM specific parses
+    Chapter numbers
+    >>> list(parser(['\\id TEST\\c\\p \\v 1 text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,9: missing chapter number after \\c
+    >>> list(parser(['\\id TEST\\c A\\p \\v 1 text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,9: missing chapter number after \\c
+    >>> list(parser([r'\\id TEST\\c 1 text\\p \\v 1 text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,14: text cannot follow chapter marker '\\c 1'
+    >>> list(parser([r'\\id TEST\\c 1text\\p \\v 1 text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,13: missing space after chapter number '1'
+
+    Verse numbers
+    >>> list(parser([r'\\id TEST\\c 1\\p \\v \\p text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,16: missing verse number after \\v
+    >>> list(parser([r'\\id TEST\\c 1\\p \\v text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,16: missing verse number after \\v
+    >>> list(parser([r'\\id TEST\\c 1\\p \\v 1text']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,21: missing space after verse number '1t'
+
+    Note text parsing
+    >>> list(parser([r'\\id TEST\\mt \\f \\fk key\\fk* text.\\f*']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,13: missing caller parameter after \\f
+    >>> list(parser([r'\\id TEST\\mt \\f +text \\fk key\\fk* text.\\f*']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,17: missing space after caller parameter '+'
+
+    Test warnable condition detection and reporting
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("error", SyntaxWarning)
+    ...     list(parser([r'\\id TEST\\mt \\whoops']))
+    Traceback (most recent call last):
+    ...
+    SyntaxWarning: <string>: line 1,14: unknown marker \whoops: not in stylesheet
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("error", SyntaxWarning)
+    ...     list(parser([r'\\id TEST\\mt \\whoops'],
+    ...                 error_level=sfm.ErrorLevel.Marker))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,14: unknown marker \whoops: not in stylesheet
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("error", SyntaxWarning)
+    ...     list(parser([r'\\id TEST\\mt \\zwhoops'],
+    ...                 error_level=sfm.ErrorLevel.Note))
+    Traceback (most recent call last):
+    ...
+    SyntaxWarning: <string>: line 1,14: unknown private marker \zwhoops: not it stylesheet using default marker definition
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("error", SyntaxWarning)
+    ...     list(parser([r'\\id TEST\\c 1\\p a \\png b \\+w c \\+nd d \\png e \\png*']))
+    ... # doctest: +NORMALIZE_WHITESPACE
+    [Element('id',
+        content=[Text('TEST'),
+                 Element('c', args=['1'],
+                    content=[Element('p',
+                        content=[Text('a '),
+                                 Element('png',
+                                    content=[Text('b '),
+                                             Element('w',
+                                                content=[Text('c '),
+                                                         Element('nd',
+                                                            content=[Text('d ')])])]),
+                                 Element('png',
+                                    content=[Text('e ')])])])])]
+    >>> with warnings.catch_warnings():
+    ...     warnings.simplefilter("error", SyntaxWarning)
+    ...     list(parser([r'\\id TEST\\c 1\\p a \\f + \\fr 1:1 \\ft a \\png b\\png*']))
+    Traceback (most recent call last):
+    ...
+    SyntaxError: <string>: line 1,1: invalid end marker end-of-file: \\f (line 1,18) can only be closed with \\f*
+    '''  # noqa: E501
 
     default_meta = _default_meta
-    _eos = Text("end-of-file")
+    numeric_re = re.compile(r'\s*(\d+(:?[-\u2010\2011]\d+)?)', re.UNICODE)
+    verse_re = re.compile(r'\s*(\d+\w?(:?[-,\u200B-\u2011]+\d+\w?)?)',
+                          re.UNICODE)
+    caller_re = re.compile(r'\s*([^\s\\])', re.UNICODE)
+    sep_re = re.compile(r'\s|$', re.UNICODE)
+    __unspecified_metas = {
+        ('Section', True): 's',
+        ('Title', True): 't',
+        ('VerseText', True): 'p',
+        ('VerseText', False): 'nd',
+        ('Other', True): 'p',
+        ('Other', False): 'nd',
+        ('Unspecified', True): 'p',
+        ('Unspecified', False): 'nd'
+    }
 
     @classmethod
-    def extend_stylesheet(cls, stylesheet, *names):
-        return dict({m: cls.default_meta.copy() for m in names}, **stylesheet)
+    def extend_stylesheet(cls, *names, **kwds):
+        return super().extend_stylesheet(
+                kwds.get('stylesheet', default_stylesheet), *names)
 
     def __init__(self, source,
-                 stylesheet={},
+                 stylesheet=default_stylesheet,
                  default_meta=_default_meta,
-                 private_prefix=None, error_level=ErrorLevel.Content,
-                 tag_escapes=r'\\'):
-        """
-        Create a SFM parser object. This object is an interator over SFM
-        Element trees. For simple unstructured documents this is one element
-        per line, for more complex stylsheet guided parse this can be one or
-        more complete element trees.
+                 canonicalise_footnotes=True,
+                 *args, **kwds):
+        if not canonicalise_footnotes:
+            self._canonicalise_footnote = lambda x: x
 
-        source: An interable sequence of lines, such as a File like object,
-            representing the document.
-        stylesheet: A style sheet dict mapping marker names to metadata, used
-            to guide parsing documet structure. Optional
-        default_meta: Marker metadata to use when a marker cannot be found in
-            the stylesheet or is in the private namespace. If none are supplied
-            the following is used: dict(TextType=default',
-                                        OccursUnder={None},
-                                        Endmarker=None,
-                                        StyleType=None)
-        private_prefix: Prefix identifying the private marker namespace. If a
-            marker begins with this, then it is not an error for it to not
-            appear in the stylesheet and it assigned default metadata.
-            Optional: If not passed there is no private namespace defined.
-        error_level: The ErrorLevel at which or above the parser should report
-            issues as Errors instead of Warnings.
-        tag_escapes: A regular expression which defines the set of marker
-            names that are treated as text instead or parsed as markers. This
-            is matched against the marker name after the initial slash.
-            Optional, defaults to r'\\\\' to allow for escaping the backslash.
-        """
-        # Pick the marker lookup failure mode.
-        assert default_meta or not private_prefix, \
-            'default_meta must be provided when using private_prefix'
-        assert error_level <= ErrorLevel.Marker or default_meta,    \
-            'default meta must be provided when'                    \
-            ' error_level > ErrorLevel.Marker'
+        stylesheet = self.__synthesise_private_meta(stylesheet, default_meta)
+        for m in stylesheet.values():
+            if m['StyleType'] == 'Milestone':
+                m.update(Endmarker='*')
+        super().__init__(source,
+                         stylesheet,
+                         default_meta,
+                         private_prefix='z',
+                         *args, **kwds)
 
-        # Set simple attributes
-        self.source = getattr(source, 'name', '<string>')
-        self._default_meta = default_meta
-        self._pua_prefix = private_prefix
-        self._tokens = _put_back_iter(self.__lexer(
-            source,
-            re.compile(rf'(?:\\(?:{tag_escapes})|[^\\])+|\\[^\s|\\]+',
-                       re.DOTALL | re.UNICODE)))
-        self._error_level = error_level
-        self._escaped_tag = re.compile(rf'^\\{tag_escapes}',
-                                       re.DOTALL | re.UNICODE)
-
-        # Compute end marker stylesheet definitions
-        em_def = {'TextType': None, 'Endmarker': None}
-        self._sty = stylesheet.copy()
-        self._sty.update(
-            (m['Endmarker'], type(m)(em_def, OccursUnder={k}))
-            for k, m in stylesheet.items()
-            if m['Endmarker'])
-
-    def _error(self, severity, msg, ev, *args, **kwds):
-        """
-        Raise a SyntaxError or SyntaxWarning, or skip as appropriate based on
-        the error level in the parser and the severity of the error. The error
-        message will have the source file and line and column of the issue
-        prepended to the caller supplied message.
-
-        severity: The severity or the issue being reported.
-        msg: specific message about the problem, if this includes any of the
-            following format syntax markers they will be filled out:
-                {token}:  The Text object ev representing the subject token.
-                {source}: The source name.
-        ev: The Text object representing the token at which the issue occured.
-        Any remaining aguments or keyword arguments are used to format the msg
-        string.
-        """
-        msg = (f'{self.source}: line {ev.pos.line},{ev.pos.col}: '
-               f'{str(msg).format(token=ev,source=self.source, *args,**kwds)}')
-        if severity >= 0 and severity >= self._error_level:
-            raise SyntaxError(msg)
-        elif severity < 0 and severity < self._error_level:
-            pass
-        else:
-            warnings.warn_explicit(msg, SyntaxWarning,
-                                   self.source,
-                                   ev.pos.line)
-
-    def __get_style(self, tag):
-        meta = self._sty.get(tag.lstrip('+'))
-        if not meta:
-            if self._pua_prefix and tag.startswith(self._pua_prefix):
-                self._error(
-                    ErrorLevel.Note,
-                    'unknown private marker \\{token}: '
-                    'not it stylesheet using default marker definition',
-                    tag)
-            else:
-                self._error(
-                    ErrorLevel.Marker,
-                    'unknown marker \\{token}: not in stylesheet',
-                    tag)
-            return self._default_meta
-
-        return meta
-
-    def __iter__(self):
-        return self._default_(None)
-
-    @staticmethod
-    def __pp_marker_list(tags):
-        return ', '.join('\\'+c if c else 'toplevel' for c in sorted(tags))
-
-    @staticmethod
-    def __lexer(lines, tokeniser):
-        """ Return an iterator that returns tokens in a sequence:
-            marker, text, marker, text, ...
-        """
-        lmss = list(enumerate(map(tokeniser.finditer, lines)))
-        fs = (Text(m.group(), Position(l+1, m.start()+1))
-              for l, ms in lmss for m in ms)
-        gs = groupby(fs, operator.methodcaller('startswith', '\\'))
-        return chain.from_iterable(g if istag else (Text.concat(g),)
-                                   for istag, g in gs)
-
-    def __get_tag(self, parent: Optional[Element], tok: str):
-        if tok[0] != '\\' or self._escaped_tag.match(tok):
-            return None
-
-        tok = tok[1:]
-        tag = Tag(tok.lstrip('+'), tok[0] == '+')
-        if parent is None:
-            return tag
-
-        # Check for the expected end markers with no separator and
-        # break them apart
-        while parent.meta['Endmarker']:
-            if tag.name.startswith(parent.meta['Endmarker']):
-                cut = len(parent.meta['Endmarker'])
-                rest = tag.name[cut:]
-                if rest:
-                    tag = Tag(tag.name[:cut], tag.nested)
-                    if self._tokens.peek()[0] != '\\':
-                        # If the next token isn't a marker, coaleces the
-                        # remainder with it into a single text node.
-                        rest += next(self._tokens, '')
-                    self._tokens.put_back(rest)
-                return tag
-            parent = parent.parent
-        return tag
-
-    @staticmethod
-    def __need_subnode(parent, tag, meta):
-        occurs = meta['OccursUnder']
-        if not occurs:  # No occurs under means it can occur anywhere.
-            return True
-
-        parent_tag = None
-        if parent is not None:
-            if tag.nested and not tag.endmarker:
-                if not parent.meta['StyleType'] == 'Character':
-                    return False
-                while parent.meta['StyleType'] == 'Character':
-                    parent = parent.parent
-            parent_tag = getattr(parent, 'name', None)
-        return parent_tag in occurs
-
-    def _default_(self, parent):
-        for tok in self._tokens:
-            tag = self.__get_tag(parent, tok)
-            if tag:  # Parse markers.
-                # if tag.name == '*':
-                #     parent.annotations['milestone'] = True
-                #     return
-                meta = self.__get_style(tag.name)
-                if self.__need_subnode(parent, tag, meta):
-                    sub_parser = meta.get('TextType')
-                    if not sub_parser:
-                        return
-                    sub_parser = getattr(self, '_'+sub_parser+'_',
-                                         self._default_)
-                    # Spawn a sub-node
-                    e = Element(tag.name, tok.pos, parent=parent, meta=meta)
-                    # and recurse
-                    if tag.nested:
-                        e.annotations['nested'] = True
-                    e.extend(sub_parser(e))
-                    yield e
-                elif parent is None:
-                    tok = Text(tag, tok.pos, tok.parent)
-                    # We've failed to find a home for marker tag, poor thing.
-                    if not meta['TextType']:
-                        assert len(meta['OccursUnder']) == 1
-                        self._error(ErrorLevel.Unrecoverable,
-                                    'orphan end marker {token}: '
-                                    'no matching opening marker \\{0}',
-                                    tok, list(meta['OccursUnder'])[0])
-                    else:
-                        self._error(ErrorLevel.Unrecoverable,
-                                    'orphan marker {token}: '
-                                    'may only occur under {0}', tok,
-                                    self.__pp_marker_list(meta['OccursUnder']))
-                else:
-                    tok = Text(tag, tok.pos, tok.parent)
-                    # Do implicit closure only for non-inline markers or
-                    # markers inside NoteText type markers'.
-                    if parent.meta['Endmarker']:
-                        self._force_close(parent, tok)
-                        parent.annotations['implicit-closed'] = True
-                    self._tokens.put_back(tok)
-                    return
-            else:   # Pass non marker data through with a litte fix-up
-                if parent is not None \
-                        and len(parent) == 0 \
-                        and not tok.startswith(('\r\n', '\n', '\\', '|')):
-                    tok = tok[1:]
-                if tok:
-                    tok.parent = parent
-                    yield tok
-        if parent is not None:
-            if parent.meta['Endmarker']:
-                self._force_close(parent, self._eos)
-                parent.annotations['implicit-closed'] = True
-        return
-
-    def _Milestone_(self, parent):
-        return tuple()
-    _milestone_ = _Milestone_
-
-    _Other_ = _default_
-    _other_ = _Other_
-    _Unspecified_ = _default_
-    _unspecified_ = _Unspecified_
+    @classmethod
+    def __synthesise_private_meta(cls, sty, default_meta):
+        private_metas = dict(r for r in sty.items() if r[0].startswith('z'))
+        metas = {
+            n: sty.get(
+                cls.__unspecified_metas.get(
+                    (m['TextType'], m['Endmarker'] is None
+                        and m.get('StyleType', None) == 'Paragraph'),
+                    None),
+                default_meta).copy()
+            for n, m in private_metas.items()
+        }
+        return style.update_sheet(sty,
+                                  style.update_sheet(metas, private_metas))
 
     def _force_close(self, parent, tok):
-        """
-        Called by the parser when it needs to force an element, which has an
-        Endmarker, closed due to implicit closure, such as an outer inline
-        endmarker or paragraph level marker closing any currently open inline
-        markers.
-        This method should be overridden by subclasses to change default
-        behaviour of treating this as a structural error.
-
-        parent: The Element being forced closed.
-        tok: The token causing the implicit closure.
-        """
-        self._error(
-            ErrorLevel.Structure,
-            'invalid end marker {token}: \\{0.name} '
-            '(line {0.pos.line},{0.pos.col}) can only be closed with \\{1}',
-            tok, parent,
-            parent.meta['Endmarker'])
-
-
-def sreduce(elementf, textf, trees, initial):
-    """
-    Reduce sequence of element trees down to a single object. Used for same
-    tasks a normal reduce but it operates on the element tree structure rather
-    than a linear sequence. As such it takes 2 functions for handling nodes and
-    leaves idependantly.
-
-    elementf: A callable that accepts 3 parameters and returns a new
-        accumulator value.
-        e: The Element node under consideration.
-        a: The current accumulator object.
-        body: The elements reduced children.
-    textf: A callable the accepts 2 parameters and returns a new accumulator
-        value.
-        t: The Text node under consideration.
-        a: The current accumulator object.
-    trees: An iterable over Element trees, generaly the output of parser().
-    initial:  The initial value for the accumulator.
-
-    A crude word count example:
-    >>> doc =r'''\\lonely
-    ... \\sfm text
-    ... bare text
-    ... \\more-sfm more text
-    ... over a line break\\marker'''.splitlines(True)
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     sreduce(lambda e, a, b: 1 + len(e.args) + a + b,
-    ...             lambda t, a: a + len(t.split()),
-    ...             parser(doc),
-    ...             0)
-    12
-    """
-    def _g(a, e):
-        if isinstance(e, str):
-            return textf(e, a)
-        return elementf(e, a, reduce(_g, e, initial))
-    return reduce(_g, trees, initial)
-
-
-def smap(elementf, textf, trees):
-    """
-    Map sequence of element trees down into another sequence of structurally
-    identical element trees. Used for same tasks a normal map but it operates
-    on the element tree structure rather than a linear sequence. As such it
-    takes 2 functions for handling nodes and leaves idependantly.
-
-    elementf: A callable that accepts 3 parameters and returns a tuple of
-            (name, args, children)
-        name: The current element name
-        args: The current element argument list
-        body: The elements mapped children.
-    textf: A callable the accepts 1 parameters and returns a new Text node
-        t: The Text node to be transformed
-    trees: An iterable over Element trees, generaly the output of parser().
-
-
-    A crude upper casing example:
-    >>> doc =r'''\\lonely
-    ... \\sfm text
-    ... bare text
-    ... \\more-sfm more text
-    ... over a line break\\marker'''.splitlines(True)
-    >>> with warnings.catch_warnings():
-    ...     warnings.simplefilter("ignore")
-    ...     print(generate(smap(
-    ...         lambda n, a, b: (n.upper(), [x.upper() for x in a], b),
-    ...         lambda t: t.upper(),
-    ...         parser(doc))))
-    \\LONELY
-    \\SFM TEXT
-    BARE TEXT
-    \\MORE-SFM MORE TEXT
-    OVER A LINE BREAK\\MARKER
-    """
-    def _g(e):
-        if isinstance(e, Element):
-            name, args, cs = elementf(e.name, e.args, map(_g, e))
-            e = Element(name, e.pos, args, content=cs, meta=e.meta)
-            reduce(lambda _, e_: setattr(e_, 'parent', e), e, None)
-            return e
+        if tok is not sfm.parser._eos \
+                and ('NoteText' in parent.meta.get('TextType', [])
+                     or parent.meta.get('StyleType', None) == 'Character'):
+            self._error(ErrorLevel.Note,
+                        'implicit end marker before {token}: \\{0.name} '
+                        '(line {0.pos.line},{0.pos.col}) '
+                        'should be closed with \\{1}', tok, parent,
+                        parent.meta['Endmarker'])
         else:
-            e_ = textf(e)
-            return Text(e_, e.pos, e)
-    return map(_g, trees)
+            super()._force_close(parent, tok)
+
+    def _ChapterNumber_(self, chapter_marker):
+        tok = next(self._tokens)
+        chapter = self.numeric_re.match(tok)
+        if not chapter:
+            self._error(ErrorLevel.Content,
+                        'missing chapter number after \\c',
+                        chapter_marker)
+            chapter_marker.args = ['\uFFFD']
+        else:
+            chapter_marker.args = [str(tok[chapter.start(1):chapter.end(1)])]
+            tok = tok[chapter.end():]
+        if tok and not self.sep_re.match(tok):
+            self._error(ErrorLevel.Content,
+                        'missing space after chapter number \'{chapter}\'',
+                        tok, chapter=chapter_marker.args[0])
+        tok = tok.lstrip()
+        if tok:
+            if tok[0] == '\\':
+                self._tokens.put_back(tok)
+            else:
+                self._error(ErrorLevel.Structure,
+                            'text cannot follow chapter marker \'{0}\'',
+                            tok, chapter_marker)
+                chapter_marker.append(sfm.Element(None,
+                                                  meta=self.default_meta,
+                                                  content=[tok]))
+                tok = None
+
+        return self._default_(chapter_marker)
+    _chapternumber_ = _ChapterNumber_
+
+    def _VerseNumber_(self, verse_marker):
+        '''
+        '''
+        tok = next(self._tokens)
+        verse = self.verse_re.match(tok)
+        if not verse:
+            self._error(ErrorLevel.Content,
+                        'missing verse number after \\v',
+                        verse_marker)
+            verse_marker.args = ['\uFFFD']
+        else:
+            verse_marker.args = [str(tok[verse.start(1):verse.end(1)])]
+            tok = tok[verse.end():]
+
+        if not self.sep_re.match(tok):
+            self._error(ErrorLevel.Content,
+                        'missing space after verse number \'{verse}\'',
+                        tok, verse=verse_marker.args[0])
+        tok = tok[1:]
+
+        if tok:
+            self._tokens.put_back(tok)
+        return tuple()
+    _versenumber_ = _VerseNumber_
+
+    @staticmethod
+    def _canonicalise_footnote(content):
+        def g(e):
+            if getattr(e, 'name', None) == 'ft':
+                e.parent.annotations['content-promoted'] = True
+                if len(e.parent) > 0:
+                    prev = e.parent[-1]
+                    if prev.meta['StyleType'] == 'Character':
+                        del prev.annotations['implicit-closed']
+                return e
+            else:
+                return [e]
+        return chain.from_iterable(map(g, content))
+
+    def _NoteText_(self, parent):
+        if parent.meta.get('StyleType') != 'Note':
+            return self._default_(parent)
+
+        tok = next(self._tokens)
+        caller = self.caller_re.match(tok)
+        if not caller:
+            self._error(ErrorLevel.Content,
+                        'missing caller parameter after \\{token.name}',
+                        parent)
+            parent.args = ['\uFFFD']
+        else:
+            parent.args = [str(tok[caller.start(1):caller.end(1)])]
+            tok = tok[caller.end():]
+
+        if not self.sep_re.match(tok):
+            self._error(ErrorLevel.Content,
+                        'missing space after caller parameter \'{caller}\'',
+                        tok, caller=parent.args[0])
+
+        if tok.lstrip():
+            self._tokens.put_back(tok)
+
+        return self._canonicalise_footnote(self._default_(parent))
+    _notetext_ = _NoteText_
+
+    def _Unspecified_(self, parent):
+        orig_name = parent.name
+        if (parent.meta.get('StyleType') == 'Paragraph'
+           or (parent.parent is not None
+               and parent.parent.meta.get('StyleType') == 'Note'
+               and 'Endmarker' not in parent.meta)):
+            parent.name = 'p'
+        subparse = self._default_(parent)
+        parent.name = orig_name
+        return subparse
+    _unspecified_ = _Unspecified_
 
 
-def sfilter(pred, trees):
-    """
-    Filter a sequence of element trees down into another sequence of
-    structurally similar element trees, keeping only nodes and leaves wich
-    return True when passed to a predicate function. Used for same tasks a
-    normal filter but it operates on the element tree structure rather than a
-    linear sequence.
+class Reference(sfm.Position):
+    def __new__(cls, pos, ref):
+        p = super().__new__(cls, *pos)
+        p.book = ref[0]
+        p.chapter = ref[1]
+        p.verse = ref[2]
+        return p
 
-    pred: A callable which takes 1 parameter and return True of False. If this
-        function returns False for an element then it and all it's children
-        will absent from silter()'s output.
-        e: The Element or Text node under consideration.
-    trees: An iterable over Element trees, generaly the output of parser().
-    """
-    def _g(a, e):
-        if isinstance(e, Text):
-            if pred(e.parent):
-                a.append(Text(e, e.pos, a or None))
-            return a
-        e_ = Element(e.name, e.pos, e.args, parent=a or None, meta=e.meta)
-        reduce(_g, e, e_)
-        if len(e_) or pred(e):
-            a.append(e_)
-        return a
-    return reduce(_g, trees, [])
+    def advance(self, n):
+        return Reference(super().advance(n),
+                         [self.book, self.chapter, self.verse])
 
 
-def _path(e):
-    r = []
-    while (e is not None):
-        r.append(e.name)
-        e = e.parent
-    r.reverse()
-    return r
+def decorate_references(source):
+    ref = [None, None, None]
 
-
-def mpath(*path):
-    """
-    Create a predicate function that tests if the path to a node
-    in an Element tree is suffixed by the argument list passed to this
-    function.
-    The returned callable can be used as a predicate to the sfilter() function.
-
-    E.g. mpath('c','p','v') produces a predicate that matches all verses in all
-    chapters of a USFM document.
-    """
-    path = list(path)
-    pr_slice = slice(len(path))
-    def _pred(e): return path == _path(e)[pr_slice]
-    return _pred
-
-
-def text_properties(*args):
-    """
-    Create a predicate function that tests if a marker's text properties
-    contain all the properties passed as arguments to this function.
-    The returned callable can be used as a predicate to the sfilter() function.
-    """
-    props = set(args)
-    def _props(e): return props <= set(e.meta.get('TextProperties', []))
-    return _props
-
-
-def generate(doc):
-    """
-    Format a document inserting line separtors after paragraph markers where
-    the first element has children.
-
-    trees: An iterable over Element trees, such as the output of parser().
-
-    >>> doc = r'\\id TEST' '\\n' \\
-    ...       r'\\mt \\p A paragraph' \\
-    ...       r' \\qt A \\+qt quote\\+qt*\\qt*'
-    >>> tss = parser.extend_stylesheet({}, 'id', 'mt', 'p', 'qt')
-    >>> tss['mt'].update(OccursUnder={'id'},StyleType='Paragraph')
-    >>> tss['p'].update(OccursUnder={'mt'}, StyleType='Paragraph')
-    >>> tss['qt'].update(OccursUnder={'p'},
-    ...                  StyleType='Character',
-    ...                  Endmarker='qt*')
-    >>> tree = list(parser(doc.splitlines(True), tss))
-    >>> print(''.join(map(str, tree)))
-    \\id TEST
-    \\mt \\p A paragraph \\qt A \\+qt quote\\+qt*\\qt*
-    >>> print(generate(tree))
-    \\id TEST
-    \\mt
-    \\p A paragraph \\qt A \\+qt quote\\+qt*\\qt*
-
-    Top level Character style markers can have automatic nesting rendering
-    overridden by setting the 'nested' annotation. This out of spec, but
-    useful for generating fragments of a tree.
-    >>> tree[0][1][0][1].annotations['nested'] = True
-    >>> print(generate(tree))
-    \\id TEST
-    \\mt
-    \\p A paragraph \\+qt A \\+qt quote\\+qt*\\+qt*
-
-    But it cannot be turned off if it is required
-    >>> tree = list(parser(doc.splitlines(True), tss))
-    >>> tree[0][1][0][1][1].annotations['nested'] = False
-    >>> print(generate(tree))
-    \\id TEST
-    \\mt
-    \\p A paragraph \\qt A \\+qt quote\\+qt*\\qt*
-    """
-
-    def ge(e, a, body):
-        styletype = e.meta['StyleType']
-        parent_styletype = e.parent and e.parent.meta['StyleType']
-        sep = ''
-        if len(e) > 0:
-            if styletype == 'Paragraph' \
-                    and isinstance(e[0], Element) \
-                    and e[0].meta['StyleType'] == 'Paragraph':
-                sep = os.linesep
-            elif not body.startswith(('\r\n', '\n')):
-                sep = ' '
-        elif styletype == 'Character':
-            body = ' '
-        elif styletype == 'Paragraph':
-            body = os.linesep
-        nested = '+' if 'nested' in e.annotations \
-                        or parent_styletype == 'Character' else ''
-        end = ''
-        if 'implicit-closed' not in e.annotations:
-            end = e.meta.get('Endmarker', '') or ''
-        end = end and f"\\{nested}{end}"
-
-        return f"{a}\\{nested}{' '.join([e.name] + e.args)}{sep}{body}{end}" \
-               if e.name else ''
-
-    def gt(t, a):
-        return a + t
-
-    return sreduce(ge, gt, doc, '')
-
-
-def copy(trees):
-    """
-    Deep copy sequence of Element trees.
-    """
-    def id_element(name, args, children): return (name, args[:], children)
-    def id_text(t): return t[:]
-    return smap(id_element, id_text, trees)
+    def _g(_, e):
+        if isinstance(e, sfm.Element):
+            if e.name == 'id':
+                ref[0] = str(e[0]).split()[0]
+            elif e.name == 'c':
+                ref[1] = e.args[0]
+            elif e.name == 'v':
+                ref[2] = e.args[0]
+            e.pos = Reference(e.pos, ref)
+            return reduce(_g, e, None)
+        else:
+            e.pos = Reference(e.pos, ref)
+    source = list(source)
+    reduce(_g, source, None)
+    return source

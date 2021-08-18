@@ -19,7 +19,7 @@ __history__ = '''
         boolean false descriptions 'off','no' etc.
         Make the field value parser accept empty field values.
 '''
-from .. import sfm
+from . import sfm
 from functools import partial, reduce
 from itertools import chain
 from typing import NamedTuple, Mapping
