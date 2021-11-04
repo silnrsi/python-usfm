@@ -18,8 +18,7 @@ __email__ = "tim_eves@sil.org"
 
 import re
 
-from .sfm import ErrorLevel
-from . import records
+from . import records, ErrorLevel
 import warnings
 from collections import abc
 from .records import sequence, unique
