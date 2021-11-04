@@ -18,11 +18,12 @@ __email__ = "tim_eves@sil.org"
 
 import re
 
-from . import records, ErrorLevel
+from . import records
 import warnings
 from collections import abc
 from .records import sequence, unique
 from .records import UnrecoverableError
+from .sfm import ErrorLevel
 
 
 _comment = re.compile(r'\s*#(?:!|.*$)')
